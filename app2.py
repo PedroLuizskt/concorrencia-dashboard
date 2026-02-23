@@ -1,0 +1,407 @@
+# --- BLOCO 1: IMPORTS E CONFIGURAÇÃO ---
+import os
+import pandas as pd
+import numpy as np
+import plotly.express as px
+import plotly.graph_objects as go
+import matplotlib.pyplot as plt
+import seaborn as sns
+import streamlit as st
+from fpdf import FPDF
+from datetime import datetime
+import unicodedata
+
+# Configuração da Página (War Room Theme -> Adaptado para Corporate Retail)
+st.set_page_config(
+    page_title="Market Mapping - Varejo B2B",
+    layout="wide",
+    initial_sidebar_state="expanded",
+    page_icon="🛒"
+)
+
+# Paleta Semântica (Corporate Teal/Blue - Estilo do Relatório)
+ORDER_TIER = ['Micro Empresa', 'Pequeno Porte', 'Medio/Grande Porte']
+WAR_PALETTE = ["#bdc3c7", "#2f4b7c", "#003f5c"] # Cinza para Micro, Azul para Médio/Grande
+COLOR_MAP = {k: v for k, v in zip(ORDER_TIER, WAR_PALETTE)}
+
+# --- BLOCO 2: CARGA DE DADOS ---
+@st.cache_data(ttl=3600)
+def load_data() -> pd.DataFrame:
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    file_path = os.path.join(base_dir, 'leads_varejo_processed.parquet')
+
+    if not os.path.exists(file_path):
+        st.error(f"Base de dados não encontrada em: {file_path}. Rode o script de ETL primeiro.")
+        st.stop()
+
+    df = pd.read_parquet(file_path)
+    
+    # Tratamentos de segurança
+    if 'is_golden_lead' not in df.columns:
+        df['is_golden_lead'] = df['porte_calc'].isin(['Medio/Grande Porte']).astype(int)
+        
+    if 'bairro_norm' not in df.columns and 'bairro' in df.columns:
+        df['bairro_norm'] = df['bairro'].astype(str).str.title().str.strip()
+    elif 'bairro_norm' not in df.columns:
+        df['bairro_norm'] = 'Nao Informado'
+        
+    # Garante a existência do municipio_visual
+    if 'municipio_visual' not in df.columns:
+        df['municipio_visual'] = df['municipio_norm'].str.title()
+        
+    return df
+
+# --- BLOCO 3: SIDEBAR (FILTROS) ---
+def sidebar_filters(df: pd.DataFrame):
+    st.sidebar.markdown("## 🎯 Radar de Prospecção")
+    st.sidebar.markdown("Filtre sua área de atuação:")
+    
+    # Filtro de Estado
+    lista_ufs = [str(x) for x in df['uf_norm'].dropna().unique().tolist()]
+    opts_uf = ["Todos"] + sorted(lista_ufs)
+    sel_uf = st.sidebar.selectbox("Estado (UF)", opts_uf, index=0)
+    
+    df_filtered = df.copy()
+    sel_cidade = "Todas"
+    
+    if sel_uf != "Todos":
+        df_filtered = df_filtered[df_filtered['uf_norm'] == sel_uf]
+        
+        # Filtro de Cidade
+        lista_cidades = [str(x) for x in df_filtered['municipio_visual'].dropna().unique().tolist()]
+        opts_cidade = ["Todas"] + sorted(lista_cidades)
+        sel_cidade = st.sidebar.selectbox("Cidade", opts_cidade, index=0)
+        
+        if sel_cidade != "Todas":
+            df_filtered = df_filtered[df_filtered['municipio_visual'] == sel_cidade]
+
+    # Filtro de Porte (Tier)
+    opts_tier = ORDER_TIER
+    sel_tier = st.sidebar.multiselect("Porte do Lead", opts_tier, default=opts_tier)
+    
+    if sel_tier:
+        df_filtered = df_filtered[df_filtered['porte_calc'].isin(sel_tier)]
+        
+    return df_filtered, sel_uf, sel_cidade
+
+# --- BLOCO 4: GERAÇÃO DE PDF (REPORTE EXECUTIVO TÁTICO) ---
+def generate_pdf(df_city: pd.DataFrame, cidade: str, estado: str):
+    pdf = FPDF()
+    pdf.add_page()
+    pdf.set_auto_page_break(auto=True, margin=15)
+    
+    def fix_text(text):
+        if not isinstance(text, str): return str(text)
+        try:
+            return text.encode('latin-1', 'replace').decode('latin-1')
+        except:
+            return unicodedata.normalize('NFKD', text).encode('ASCII', 'ignore').decode('utf-8')
+    
+    # Cabeçalho
+    pdf.set_font("Arial", "B", 16)
+    pdf.set_text_color(0, 63, 92) # Corporate Blue
+    pdf.cell(0, 10, fix_text(f"Dossiê Tático de Varejo: {cidade.upper()} - {estado.upper()}"), align="C", ln=1)
+    
+    pdf.set_font("Arial", "", 10)
+    pdf.set_text_color(100, 100, 100)
+    pdf.cell(0, 10, fix_text(f"Gerado em: {datetime.now().strftime('%d/%m/%Y')} | Leads mapeados: {len(df_city)}"), align="C", ln=1)
+    pdf.ln(5)
+    
+    # Resumo do Mercado Local
+    pdf.set_font("Arial", "B", 12)
+    pdf.set_text_color(40, 40, 40)
+    pdf.cell(0, 10, fix_text("1. GOLDEN LEADS LOCAIS (Top Empresas)"), ln=1)
+    pdf.set_font("Arial", "", 9)
+    pdf.multi_cell(0, 5, fix_text("As empresas listadas abaixo representam os alvos prioritários na cidade, ordenadas por estrutura de capital e maturidade. Utilize esta lista para ações de Field Sales."))
+    pdf.ln(5)
+    
+    # Tabela TOP Leads
+    col_w = [70, 40, 40, 30]
+    headers = ["Empresa", "Bairro", "Capital (R$)", "Idade (Anos)"]
+    
+    pdf.set_font("Arial", "B", 9)
+    pdf.set_fill_color(220, 220, 220)
+    for i, h in enumerate(headers):
+        pdf.cell(col_w[i], 8, fix_text(h), 1, align='C', fill=True, ln=(1 if i == 3 else 0))
+    
+    pdf.set_font("Arial", "", 8)
+    
+    # Filtra e ordena os Top 20 Leads da cidade
+    df_top = df_city.sort_values(by=['capital_social', 'idade'], ascending=[False, False]).head(20)
+    
+    if df_top.empty:
+        pdf.cell(0, 10, "Nenhum Lead relevante encontrado neste filtro.", 1, align='C', ln=1)
+    else:
+        for _, r in df_top.iterrows():
+            nome = str(r.get('razao_social', 'N/D'))[:35]
+            bairro = str(r.get('bairro_norm', 'N/D'))[:20]
+            cap = f"{r.get('capital_social', 0):,.0f}"
+            idade = f"{r.get('idade', 0):.1f}"
+            
+            pdf.cell(col_w[0], 7, fix_text(nome), 1)
+            pdf.cell(col_w[1], 7, fix_text(bairro), 1, align='C')
+            pdf.cell(col_w[2], 7, cap, 1, align='R')
+            pdf.cell(col_w[3], 7, idade, 1, align='C', ln=1)
+            
+  # Geração do PDF à prova de falhas de versão
+    pdf_out = pdf.output(dest='S')
+    
+    # Se a biblioteca retornar texto, converte para bytes
+    if isinstance(pdf_out, str):
+        return pdf_out.encode('latin-1')
+    # Se já retornar em bytes (bytearray), apenas garante o formato correto
+    else:
+        return bytes(pdf_out)
+
+# --- BLOCO 5: APP MAIN ---
+def main():
+    st.markdown("<h1 style='text-align: center; color: #003f5c;'>🛒 Bússola dos Dados: Inteligência Varejista B2B</h1>", unsafe_allow_html=True)
+    
+    st.markdown("""
+    <div style='background-color: #1E1E1E; padding: 15px; border-radius: 5px; margin-bottom: 20px; border-left: 5px solid #003f5c;'>
+        <p style='color: #E0E0E0; font-size: 16px; margin: 0;'>
+            <b>Contexto Estratégico:</b> Mapeamento do mercado de Varejo B2B. 
+            Identifique zonas de alta densidade (clusters), monitore os <i>Golden Leads</i> (Médio/Grande Porte) e analise a maturidade empresarial para mitigar riscos de crédito.
+        </p>
+    </div>
+    """, unsafe_allow_html=True)
+
+    df = load_data()
+    df_filtered, sel_uf, sel_cidade = sidebar_filters(df)
+    
+    if df_filtered.empty:
+        st.warning("Sem dados para os filtros aplicados. Tente ampliar a busca.")
+        return
+
+    # --- KPIs RÁPIDOS ---
+    total = len(df_filtered)
+    golden_leads = df_filtered['is_golden_lead'].sum()
+    mediana_cap = df_filtered['capital_social'].median()
+    
+    col1, col2, col3, col4 = st.columns(4)
+    col1.metric("Volume de Empresas", f"{total:,}")
+    col2.metric("Golden Leads (Médio/Grande)", f"{golden_leads:,}")
+    col3.metric("Capital Social Mediano", f"R$ {mediana_cap:,.0f}")
+    col4.metric("Idade Média", f"{df_filtered['idade'].mean():.1f} anos")
+    
+    st.markdown("---")
+    
+    # --- ORGANIZAÇÃO EM ABAS (STORYTELLING) ---
+    tab1, tab2, tab3, tab4 = st.tabs([
+        "🌍 Matriz de Priorização (Macro)", 
+        "🏙️ Micro-Targeting (Bairros)", 
+        "📊 Perfil de Risco e Market Share", 
+        "📋 Exportação de Leads"
+    ])
+
+    # ==========================================
+    # ABA 1: VISÃO MACRO / MATRIZ GEOGRÁFICA
+    # ==========================================
+    with tab1:
+        # LÓGICA 1: VISÃO NACIONAL TOTAL (MAPA DE CALOR)
+        if sel_uf == "Todos" and sel_cidade == "Todas":
+            st.markdown("### 🔥 Densidade Estrutural do Varejo Nacional")
+            st.markdown("*Matriz cruzando Volume Geográfico e Porte Organizacional.*")
+            
+            df_heat = df_filtered.groupby(['uf_norm', 'porte_calc']).size().unstack(fill_value=0)
+            cols_avail = [c for c in ORDER_TIER if c in df_heat.columns]
+            df_heat = df_heat[cols_avail]
+            
+            df_heat['Total_Volume'] = df_heat.sum(axis=1)
+            df_heat = df_heat.sort_values('Total_Volume', ascending=True).tail(15).drop(columns=['Total_Volume'])
+            
+            fig_heat = px.imshow(
+                df_heat,
+                labels=dict(x="Porte da Empresa", y="Estado (UF)", color="Volume Absoluto"),
+                x=df_heat.columns, y=df_heat.index, text_auto=True,
+                color_continuous_scale="Teal", aspect="auto",
+                title="Heatmap de Saturação: Top 15 Estados"
+            )
+            fig_heat.update_layout(template="plotly_dark", paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)", height=500)
+            st.plotly_chart(fig_heat, use_container_width=True)
+
+        # LÓGICA 2: VISÃO ESTADUAL (DISPERSÃO DE MUNICÍPIOS)
+        elif sel_uf != "Todos" and sel_cidade == "Todas":
+            st.markdown(f"### 📍 Matriz Tática de Expansão em {sel_uf}")
+            st.markdown("*Dispersão cruzando Volume de Leads vs Maturidade Empresarial.*")
+            
+            city_matrix = df_filtered.groupby('municipio_visual').agg(
+                total=('cnpj_completo', 'count'),
+                idade_med=('idade', 'mean'),
+                golden_leads=('is_golden_lead', 'sum')
+            ).reset_index()
+            
+            city_matrix = city_matrix[city_matrix['total'] > 5].sort_values('total', ascending=False).head(20)
+            
+            if not city_matrix.empty:
+                fig_scatter = px.scatter(
+                    city_matrix, x='idade_med', y='total', size='total', color='golden_leads',
+                    hover_name='municipio_visual', size_max=45, text='municipio_visual',
+                    title=f'Volume x Maturidade (Cor = Concentração de Golden Leads)',
+                    labels={'total': 'Volume de Empresas', 'idade_med': 'Maturidade Média (Anos)', 'golden_leads': 'Qtd Médio/Grande Porte'},
+                    color_continuous_scale='Teal'
+                )
+                fig_scatter.update_traces(textposition='top center')
+                fig_scatter.add_hline(y=city_matrix['total'].mean(), line_dash="dot", annotation_text="Volume Médio")
+                fig_scatter.add_vline(x=city_matrix['idade_med'].mean(), line_dash="dot", annotation_text="Maturidade Média")
+                fig_scatter.update_layout(template="plotly_dark", paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)", height=600)
+                st.plotly_chart(fig_scatter, use_container_width=True)
+            else:
+                st.info("Municípios insuficientes no filtro para gerar a matriz.")
+
+        # LÓGICA 3: VISÃO MUNICIPAL (BENCHMARKING)
+        elif sel_cidade != "Todas":
+            st.markdown(f"### 🧬 Benchmarking Dinâmico de Mercado: {sel_cidade}")
+            st.markdown(f"*Comparativo com os 5 municípios mais estatisticamente semelhantes em {sel_uf}.*")
+            
+            df_state_baseline = df[df['uf_norm'] == sel_uf]
+            city_matrix_full = df_state_baseline.groupby('municipio_visual').agg(
+                total=('cnpj_completo', 'count'),
+                golden_leads=('is_golden_lead', 'sum'),
+                ticket=('capital_social', 'median')
+            ).reset_index()
+            
+            sel_stats = city_matrix_full[city_matrix_full['municipio_visual'] == sel_cidade]
+            
+            if not sel_stats.empty:
+                val_total = sel_stats['total'].values[0]
+                val_gl = sel_stats['golden_leads'].values[0]
+                
+                city_matrix_full['dist_euclidiana'] = np.sqrt(
+                    ((city_matrix_full['total'] - val_total) ** 2) + 
+                    (((city_matrix_full['golden_leads'] - val_gl) * 5) ** 2)
+                )
+                
+                peer_cluster = city_matrix_full.sort_values('dist_euclidiana').head(6).copy()
+                peer_cluster['Classificação'] = peer_cluster['municipio_visual'].apply(
+                    lambda x: 'Alvo Estratégico' if x == sel_cidade else 'Cidade Similar'
+                )
+                
+                fig_peers = px.scatter(
+                    peer_cluster, x='total', y='golden_leads', size='ticket', color='Classificação',
+                    hover_name='municipio_visual', size_max=45, text='municipio_visual',
+                    title=f'Ecossistema: {sel_cidade} vs Cidades Similares',
+                    labels={'total': 'Volume de Empresas', 'golden_leads': 'Golden Leads', 'ticket': 'Capitalização Mediana'},
+                    color_discrete_map={'Alvo Estratégico': '#003f5c', 'Cidade Similar': '#2f4b7c'}
+                )
+                fig_peers.update_traces(textposition='top center', textfont=dict(size=14, color='white'))
+                fig_peers.update_layout(template="plotly_dark", paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)", height=500)
+                st.plotly_chart(fig_peers, use_container_width=True)
+
+    # ==========================================
+    # ABA 2: VISÃO MICRO (Bairros e Território)
+    # ==========================================
+    with tab2:
+        st.markdown("### 🏘️ Ecossistema de Bairros (Clusters Comerciais)")
+        st.markdown("Identifique as zonas de alta concentração comercial para otimizar roteiros de visita porta-a-porta.")
+        
+        if sel_cidade != "Todas":
+            bairros_data = df_filtered[df_filtered['bairro_norm'] != 'Nao Informado']
+            top_bairros = bairros_data['bairro_norm'].value_counts().head(15).index.tolist()
+            bairros_top = bairros_data[bairros_data['bairro_norm'].isin(top_bairros)]
+            
+            if not bairros_top.empty:
+                bairros_tier = bairros_top.groupby(['bairro_norm', 'porte_calc']).size().reset_index(name='count')
+                
+                fig_bairros = px.bar(
+                    bairros_tier, x='count', y='bairro_norm', color='porte_calc',
+                    title=f'Concentração Comercial por Bairro em {sel_cidade}',
+                    orientation='h', color_discrete_map=COLOR_MAP,
+                    category_orders={"bairro_norm": top_bairros}
+                )
+                fig_bairros.update_layout(template="plotly_dark", paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)", height=600)
+                st.plotly_chart(fig_bairros, use_container_width=True)
+            else:
+                st.info("Resolução geográfica de bairros insuficiente nesta cidade.")
+        else:
+            st.warning("⚠️ Selecione uma cidade específica no filtro lateral para visualizar o mapa de bairros.")
+
+    # ==========================================
+    # ABA 3: PERFIL DE MERCADO (Donut e Sobrevivência)
+    # ==========================================
+    with tab3:
+        c1, c2 = st.columns(2)
+        
+        with c1:
+            st.markdown("### 🍩 Market Share por Porte (Estratégia de Canal)")
+            df_tier = df_filtered['porte_calc'].value_counts().reset_index()
+            df_tier.columns = ['porte', 'count']
+            
+            fig_donut = px.pie(
+                df_tier, values='count', names='porte',
+                hole=0.5, color='porte', color_discrete_map=COLOR_MAP,
+                category_orders={'porte': ORDER_TIER}
+            )
+            fig_donut.update_traces(textposition='inside', textinfo='percent+label')
+            fig_donut.update_layout(template="plotly_dark", paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)", showlegend=False)
+            st.plotly_chart(fig_donut, use_container_width=True)
+
+        with c2:
+            st.markdown("### ⏳ Curva de Sobrevivência (Risco de Inadimplência)")
+            data_plot = df_filtered[df_filtered['idade'] <= 40]
+            
+            if not data_plot.empty:
+                fig_hist, ax = plt.subplots(figsize=(8, 5))
+                fig_hist.patch.set_facecolor('#1E1E1E')
+                ax.set_facecolor('#1E1E1E')
+                
+                sns.histplot(data=data_plot, x='idade', bins=30, kde=True, color='#2f4b7c', ax=ax)
+                ax.axvline(2, color='red', linestyle='--', linewidth=2, label="Zona Vermelha (Risco <2 anos)")
+                ax.axvline(10, color='green', linestyle='--', linewidth=2, label="Zona Verde (Premium >10 anos)")
+                
+                ax.tick_params(colors='white')
+                ax.xaxis.label.set_color('white')
+                ax.yaxis.label.set_color('white')
+                ax.title.set_color('white')
+                ax.legend()
+                
+                st.pyplot(fig_hist)
+            else:
+                st.info("Dispersão temporal insuficiente para o histograma de maturidade.")
+
+    # ==========================================
+    # ABA 4: EXPORTAÇÃO DE LEADS
+    # ==========================================
+    with tab4:
+        st.markdown("### 🎯 Listagem Qualificada de Leads (CRM)")
+        st.markdown("A tabela abaixo apresenta os melhores prospects baseados nos seus filtros, ordenados por Capital Social.")
+        
+        df_leads = df_filtered.sort_values(by=['capital_social', 'idade'], ascending=[False, False])
+        
+        cols_to_show = ['razao_social', 'municipio_visual', 'bairro_norm', 'porte_calc', 'idade', 'capital_social']
+        cols_available = [c for c in cols_to_show if c in df_leads.columns]
+        
+        st.dataframe(df_leads[cols_available].head(100), use_container_width=True)
+        
+        st.markdown("---")
+        st.markdown("### 📥 Datalake & Output Executivo")
+        
+        c_dl1, c_dl2 = st.columns(2)
+        
+        with c_dl1:
+            st.download_button(
+                "💾 Exportar Base Completa (CSV)", 
+                df_filtered.to_csv(index=False).encode('utf-8-sig'), 
+                f"leads_varejo_{sel_uf}.csv", 
+                "text/csv", 
+                use_container_width=True
+            )
+            
+        with c_dl2:
+            if sel_cidade != "Todas":
+                try:
+                    pdf_bytes = generate_pdf(df_filtered, sel_cidade, sel_uf)
+                    st.download_button(
+                        "📄 Emissão de Dossiê Tático (PDF)", 
+                        data=pdf_bytes, 
+                        file_name=f"dossie_varejo_{sel_cidade}.pdf", 
+                        mime="application/pdf", 
+                        use_container_width=True
+                    )
+                except Exception as e:
+                    st.error(f"Erro ao gerar PDF: {e}")
+            else:
+                st.button("🔒 Fixe uma Cidade no filtro lateral para liberar o Dossiê PDF", disabled=True, use_container_width=True)
+
+if __name__ == "__main__":
+    main()
