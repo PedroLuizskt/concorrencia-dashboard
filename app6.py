@@ -1,4 +1,3 @@
-<<<<<<< HEAD
 # --- BLOCO 1: IMPORTS E CONFIGURAÇÃO ---
 import os
 import pandas as pd
@@ -998,5 +997,6 @@ def main():
         render_dashboard(selecao)
 
 if __name__ == "__main__":
+
 >>>>>>> 716277610b41debe318477376cee0cdbfa6b0380
     main()
